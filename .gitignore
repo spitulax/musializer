@@ -15,3 +15,6 @@ nob.old
 nob.exe
 nob.exe.old
 nob.obj
+
+# nix build output
+result
