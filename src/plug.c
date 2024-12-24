@@ -6,8 +6,7 @@
 #include <string.h>
 #include <complex.h>
 
-#include "targets.h"
-#include "config.h"
+#include "build/config.h"
 #include "plug.h"
 #include "ffmpeg.h"
 #define NOB_IMPLEMENTATION
@@ -16,14 +15,18 @@
 #include <raylib.h>
 #include <rlgl.h>
 
-#ifdef _WIN32
-#define MUSIALIZER_PLUG __declspec(dllexport)
+#if defined(_WIN32) && defined(MUSIALIZER_HOTRELOAD)
+    #define MUSIALIZER_PLUG __declspec(dllexport)
 #else
-#define MUSIALIZER_PLUG
+    #define MUSIALIZER_PLUG
 #endif
 
+#define PLUG(name, ret, ...) MUSIALIZER_PLUG ret name(__VA_ARGS__);
+LIST_OF_PLUGS
+#undef PLUG
+
 #ifndef MUSIALIZER_UNBUNDLE
-#include "bundle.h"
+#include "build/bundle.h"
 
 MUSIALIZER_PLUG void plug_free_resource(void *data)
 {
@@ -58,8 +61,8 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 #endif
 
 #define _WINDOWS_
-#include "miniaudio.h"
-#include "dr_wav.h"
+#include "external/miniaudio.h"
+#include "external/dr_wav.h"
 
 #define GLSL_VERSION 330
 
@@ -128,53 +131,6 @@ typedef struct {
 } Tracks;
 
 typedef struct {
-    const char *key;
-    Image value;
-} Image_Item;
-
-typedef struct {
-    Image_Item *items;
-    size_t count;
-    size_t capacity;
-} Images;
-
-typedef struct {
-    const char *key;
-    Texture value;
-} Texture_Item;
-
-typedef struct {
-    Texture_Item *items;
-    size_t count;
-    size_t capacity;
-} Textures;
-
-static void *assoc_find_(void *items, size_t item_size, size_t items_count, size_t item_value_offset, const char *key)
-{
-    for (size_t i = 0; i < items_count; ++i) {
-        char *item = (char*)items + i*item_size;
-        const char *item_key = *(const char**)item;
-        void *item_value = item + item_value_offset;
-        if (strcmp(key, item_key) == 0) {
-            return item_value;
-        }
-    }
-    return NULL;
-}
-
-#define assoc_find(table, key) \
-    assoc_find_((table).items, \
-                sizeof((table).items[0]), \
-                (table).count, \
-                ((char*)&(table).items[0].value - (char*)&(table).items[0]), \
-                (key))
-
-typedef struct {
-    Images images;
-    Textures textures;
-} Assets;
-
-typedef struct {
     float lifetime;
 } Popup;
 
@@ -198,8 +154,27 @@ typedef enum {
     SIDE_BOTTOM,
 } Side;
 
+typedef enum {
+    UI_ICON_FULLSCREEN,
+    UI_ICON_VOLUME,
+    UI_ICON_PLAY,
+    UI_ICON_RENDER,
+    UI_ICON_MICROPHONE,
+    COUNT_UI_ICONS,
+} UI_Icon;
+
+static_assert(COUNT_UI_ICONS == 5, "Amount of icons changed");
+static const char *icon_file_paths[COUNT_UI_ICONS] = {
+    [UI_ICON_FULLSCREEN] = "./resources/icons/fullscreen.png",
+    [UI_ICON_VOLUME]     = "./resources/icons/volume.png",
+    [UI_ICON_PLAY]       = "./resources/icons/play.png",
+    [UI_ICON_RENDER]     = "./resources/icons/render.png",
+    [UI_ICON_MICROPHONE] = "./resources/icons/microphone.png",
+};
+
 typedef struct {
-    Assets assets;
+    // Assets
+    Texture2D icon_textures[COUNT_UI_ICONS];
 
     // Visualizer
     Tracks tracks;
@@ -217,6 +192,7 @@ typedef struct {
     float *wave_samples;
     size_t wave_cursor;
     FFMPEG *ffmpeg;
+    bool cancel_rendering;
 
     // FFT Analyzer
     float in_raw[FFT_SIZE];
@@ -226,7 +202,9 @@ typedef struct {
     float out_smooth[FFT_SIZE];
     float out_smear[FFT_SIZE];
 
+#ifndef MUSIALIZER_ACT_ON_PRESS
     uint64_t active_button_id;
+#endif // MUSIALIZER_ACT_ON_PRESS
 
     Popup_Tray pt;
 
@@ -244,50 +222,6 @@ typedef struct {
 } Plug;
 
 static Plug *p = NULL;
-
-static Image assets_image(const char *file_path)
-{
-    Image *image = assoc_find(p->assets.images, file_path);
-    if (image) return *image;
-
-    Image_Item item = {0};
-    item.key = file_path;
-
-    size_t data_size;
-    void *data = plug_load_resource(file_path, &data_size);
-    item.value = LoadImageFromMemory(GetFileExtension(file_path), data, data_size);
-    plug_free_resource(data);
-
-    nob_da_append(&p->assets.images, item);
-    return item.value;
-}
-
-static Texture assets_texture(const char *file_path)
-{
-    Texture *texture = assoc_find(p->assets.textures, file_path);
-    if (texture) return *texture;
-
-    Image image = assets_image(file_path);
-    Texture_Item item = {0};
-    item.key = file_path;
-    item.value = LoadTextureFromImage(image);
-    GenTextureMipmaps(&item.value);
-    SetTextureFilter(item.value, TEXTURE_FILTER_BILINEAR);
-    nob_da_append(&p->assets.textures, item);
-    return item.value;
-}
-
-static void assets_unload_everything(void)
-{
-    for (size_t i = 0; i < p->assets.textures.count; ++i) {
-        UnloadTexture(p->assets.textures.items[i].value);
-    }
-    p->assets.textures.count = 0;
-    for (size_t i = 0; i < p->assets.images.count; ++i) {
-        UnloadImage(p->assets.images.items[i].value);
-    }
-    p->assets.images.count = 0;
-}
 
 static bool fft_settled(void)
 {
@@ -690,8 +624,9 @@ static int button_with_id(uint64_t id, Rectangle boundary)
 {
     Vector2 mouse = GetMousePosition();
     int hoverover = CheckCollisionPointRec(mouse, boundary);
-    int clicked = 0;
 
+#ifndef MUSIALIZER_ACT_ON_PRESS
+    int clicked = 0;
     if (p->active_button_id == 0) {
         if (hoverover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             p->active_button_id = id;
@@ -702,6 +637,10 @@ static int button_with_id(uint64_t id, Rectangle boundary)
             if (hoverover) clicked = 1;
         }
     }
+#else
+    (void) id;
+    int clicked = hoverover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+#endif // MUSIALIZER_ACT_ON_PRESS
 
     return (clicked<<1) | hoverover;
 }
@@ -925,7 +864,7 @@ static int fullscreen_button_with_loc(const char *file, int line, Rectangle full
         }
     }
     Rectangle source = {icon_size*icon_index, 0, icon_size, icon_size};
-    DrawTexturePro(assets_texture("./resources/icons/fullscreen.png"), source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
+    DrawTexturePro(p->icon_textures[UI_ICON_FULLSCREEN], source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
 
     if (p->fullscreen) {
         tooltip(fullscreen_button_boundary, "Collapse [F]", SIDE_TOP, false);
@@ -1044,7 +983,7 @@ static bool volume_slider_with_location(const char *file, int line, Rectangle vo
 
     Rectangle source = {icon_size*icon_index, 0, icon_size, icon_size};
 
-    DrawTexturePro(assets_texture("./resources/icons/volume.png"), source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
+    DrawTexturePro(p->icon_textures[UI_ICON_VOLUME], source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
 
     bool updated = false;
 
@@ -1139,6 +1078,50 @@ static void popup_tray(Popup_Tray *pt, Rectangle preview_boundary)
     }
 }
 
+#define cancel_rendering_button(boundary) \
+    cancel_rendering_button_with_location(__FILE__, __LINE__, boundary)
+static int cancel_rendering_button_with_location(const char *file, int line, Rectangle boundary)
+{
+    uint64_t id = DJB2_INIT;
+    id = djb2(id, file, strlen(file));
+    id = djb2(id, &line, sizeof(line));
+
+    int state = button_with_id(id, boundary);
+
+    Color color = (state & BS_HOVEROVER) ? COLOR_TRACK_BUTTON_HOVEROVER : COLOR_TRACK_BUTTON_BACKGROUND;
+    DrawRectangleRounded(boundary, 0.4, 20, color);
+
+    float pad_x = boundary.width*0.3;
+    float pad_y = boundary.height*0.3;
+    float thick = boundary.width*0.10;
+
+    {
+        Vector2 startPos = {
+            boundary.x + pad_x,
+            boundary.y + pad_y,
+        };
+        Vector2 endPos = {
+            boundary.x + boundary.width - pad_x,
+            boundary.y + boundary.height - pad_y,
+        };
+        DrawLineEx(startPos, endPos, thick, COLOR_TOOLTIP_FOREGROUND);
+    }
+
+    {
+        Vector2 startPos = {
+            boundary.x + pad_x,
+            boundary.y + boundary.height - pad_y,
+        };
+        Vector2 endPos = {
+            boundary.x + boundary.width - pad_x,
+            boundary.y + pad_y,
+        };
+        DrawLineEx(startPos, endPos, thick, COLOR_TOOLTIP_FOREGROUND);
+    }
+
+    return state;
+}
+
 #define play_button(track, boundary) \
     play_button_with_location(__FILE__, __LINE__, (track), (boundary))
 static int play_button_with_location(const char *file, int line, Track *track, Rectangle boundary)
@@ -1160,7 +1143,7 @@ static int play_button_with_location(const char *file, int line, Track *track, R
     };
 
     Rectangle source = {icon_size*icon_index, 0, icon_size, icon_size};
-    DrawTexturePro(assets_texture("./resources/icons/play.png"), source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
+    DrawTexturePro(p->icon_textures[UI_ICON_PLAY], source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
 
     if (IsMusicStreamPlaying(track->music)) {
         tooltip(boundary, "Pause [SPACE]", SIDE_TOP, false);
@@ -1192,7 +1175,7 @@ static int render_button_with_location(const char *file, int line, Rectangle bou
     };
 
     Rectangle source = {icon_size*icon_index, 0, icon_size, icon_size};
-    DrawTexturePro(assets_texture("./resources/icons/render.png"), source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
+    DrawTexturePro(p->icon_textures[UI_ICON_RENDER], source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
 
     tooltip(boundary, "Render [R]", SIDE_TOP, false);
 
@@ -1221,9 +1204,9 @@ static int microphone_button_with_location(const char *file, int line, Rectangle
     };
 
     Rectangle source = {icon_size*icon_index, 0, icon_size, icon_size};
-    DrawTexturePro(assets_texture("./resources/icons/microphone.png"), source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
+    DrawTexturePro(p->icon_textures[UI_ICON_MICROPHONE], source, dest, CLITERAL(Vector2){0}, 0, ColorBrightness(WHITE, -0.10));
 
-    tooltip(boundary, "Microphone [C]", SIDE_TOP);
+    tooltip(boundary, "Microphone [C]", SIDE_TOP, false);
 
     return state;
 }
@@ -1251,6 +1234,7 @@ static void start_rendering_track(Track *track)
     // Basically output into the same folder
     p->ffmpeg = ffmpeg_start_rendering(p->screen.texture.width, p->screen.texture.height, RENDER_FPS, track->file_path);
     p->rendering = true;
+    p->cancel_rendering = false;
     SetTraceLogLevel(LOG_WARNING);
 }
 
@@ -1641,12 +1625,8 @@ static void rendering_screen(void)
         DrawTextEx(p->font, label, position, fontSize, 0, color);
     } else { // FFmpeg process is going
         // TODO: introduce a rendering mode that perfectly loops the video
-        if ((p->wave_cursor >= p->wave.frameCount && fft_settled()) || IsKeyPressed(KEY_ESCAPE)) { // Rendering is finished or cancelled
-            // TODO: ffmpeg processes frames slower than we generate them
-            // So when we cancel the rendering ffmpeg is still going and blocking the UI
-            // We need to do something about that. For example inform the user that
-            // we are finalizing the rendering or something.
-            if (!ffmpeg_end_rendering(p->ffmpeg)) {
+        if (p->wave_cursor >= p->wave.frameCount && fft_settled()) { // Rendering is finished
+            if (!ffmpeg_end_rendering(p->ffmpeg, false)) {
                 // NOTE: Ending FFmpeg process has failed, let's mark ffmpeg handle as NULL
                 // which will be interpreted as "FFmpeg Failure" on the next frame.
                 //
@@ -1661,6 +1641,16 @@ static void rendering_screen(void)
                 fft_clean();
                 PlayMusicStream(track->music);
             }
+        } else if (IsKeyPressed(KEY_ESCAPE) || p->cancel_rendering) {  // Rendering is cancelled
+            ffmpeg_end_rendering(p->ffmpeg, true);
+            p->ffmpeg = NULL;
+
+            SetTraceLogLevel(LOG_INFO);
+            UnloadWave(p->wave);
+            UnloadWaveSamples(p->wave_samples);
+            p->rendering = false;
+            fft_clean();
+            PlayMusicStream(track->music);
         } else { // Rendering is going...
             // Label
             const char *label = "Rendering video...";
@@ -1695,6 +1685,19 @@ static void rendering_screen(void)
             };
             DrawRectangleLinesEx(bar_box, 2, WHITE);
 
+            {
+                Rectangle boundary = {
+                    .width = HUD_BUTTON_SIZE,
+                    .height = HUD_BUTTON_SIZE,
+                };
+                boundary.x = w - boundary.width - HUD_BUTTON_SIZE*0.5;
+                boundary.y = HUD_BUTTON_SIZE*0.5;
+                tooltip(boundary, "Cancel [Esc]", SIDE_LEFT, false);
+                if (cancel_rendering_button(boundary) & BS_CLICKED) {
+                    p->cancel_rendering = true;
+                }
+            }
+
             // Rendering
             {
                 size_t chunk_size = p->wave.sampleRate/RENDER_FPS;
@@ -1724,11 +1727,55 @@ static void rendering_screen(void)
                 // don't care at this point: writing a frame failed, so something went completely
                 // wrong. So let's just show to the user the "FFmpeg Failure" screen. ffmpeg_end_rendering
                 // should log any additional errors anyway.
-                ffmpeg_end_rendering(p->ffmpeg);
+                ffmpeg_end_rendering(p->ffmpeg, false);
                 p->ffmpeg = NULL;
             }
             UnloadImage(image);
         }
+    }
+}
+
+static void load_assets(void)
+{
+    size_t data_size = 0;
+    void *data = NULL;
+
+    const char *alegreya_path = "./resources/fonts/Alegreya-Regular.ttf";
+    data = plug_load_resource(alegreya_path, &data_size);
+        p->font = LoadFontFromMemory(GetFileExtension(alegreya_path), data, data_size, FONT_SIZE, NULL, 0);
+        GenTextureMipmaps(&p->font.texture);
+        SetTextureFilter(p->font.texture, TEXTURE_FILTER_BILINEAR);
+    plug_free_resource(data);
+
+    // TODO: Maybe we should try to keep compiling different versions of shaders
+    // until one of them works?
+    //
+    // If the shader can not be compiled maybe we could fallback to software rendering
+    // of the texture of a fuzzy circle? The shader does not really do anything particularly
+    // special.
+    data = plug_load_resource(TextFormat("./resources/shaders/glsl%d/circle.fs", GLSL_VERSION), &data_size);
+        p->circle = LoadShaderFromMemory(NULL, data);
+        p->circle_radius_location = GetShaderLocation(p->circle, "radius");
+        p->circle_power_location = GetShaderLocation(p->circle, "power");
+    plug_free_resource(data);
+
+    for (UI_Icon icon = 0; icon < COUNT_UI_ICONS; ++icon) {
+        data = plug_load_resource(icon_file_paths[icon], &data_size);
+            Image image = LoadImageFromMemory(GetFileExtension(icon_file_paths[icon]), data, data_size);
+                p->icon_textures[icon] = LoadTextureFromImage(image);
+                GenTextureMipmaps(&p->icon_textures[icon]);
+                SetTextureFilter(p->icon_textures[icon], TEXTURE_FILTER_BILINEAR);
+            UnloadImage(image);
+        plug_free_resource(data);
+    }
+}
+
+static void unload_assets()
+{
+    UnloadFont(p->font);
+    UnloadShader(p->circle);
+    for (UI_Icon icon = 0; icon < COUNT_UI_ICONS; ++icon) {
+        UnloadTexture(p->icon_textures[icon]);
     }
 }
 
@@ -1738,29 +1785,7 @@ MUSIALIZER_PLUG void plug_init(void)
     assert(p != NULL && "Buy more RAM lol");
     memset(p, 0, sizeof(*p));
 
-    const char *alegreya_path = "./resources/fonts/Alegreya-Regular.ttf";
-    {
-        size_t data_size;
-        void *data = plug_load_resource(alegreya_path, &data_size);
-        p->font = LoadFontFromMemory(GetFileExtension(alegreya_path), data, data_size, FONT_SIZE, NULL, 0);
-        plug_free_resource(data);
-    }
-    GenTextureMipmaps(&p->font.texture);
-    SetTextureFilter(p->font.texture, TEXTURE_FILTER_BILINEAR);
-    // TODO: Maybe we should try to keep compiling different versions of shaders
-    // until one of them works?
-    //
-    // If the shader can not be compiled maybe we could fallback to software rendering
-    // of the texture of a fuzzy circle? The shader does not really do anything particularly
-    // special.
-    {
-        size_t data_size;
-        void *data = plug_load_resource(TextFormat("./resources/shaders/glsl%d/circle.fs", GLSL_VERSION), &data_size);
-        p->circle = LoadShaderFromMemory(NULL, data);
-        plug_free_resource(data);
-    }
-    p->circle_radius_location = GetShaderLocation(p->circle, "radius");
-    p->circle_power_location = GetShaderLocation(p->circle, "power");
+    load_assets();
     p->screen = LoadRenderTexture(RENDER_WIDTH, RENDER_HEIGHT);
     p->current_track = -1;
 
@@ -1768,31 +1793,24 @@ MUSIALIZER_PLUG void plug_init(void)
     SetMasterVolume(0.5);
 }
 
-MUSIALIZER_PLUG Plug *plug_pre_reload(void)
+MUSIALIZER_PLUG void *plug_pre_reload(void)
 {
     for (size_t i = 0; i < p->tracks.count; ++i) {
         Track *it = &p->tracks.items[i];
         DetachAudioStreamProcessor(it->music.stream, callback);
     }
-    assets_unload_everything();
+    unload_assets();
     return p;
 }
 
-MUSIALIZER_PLUG void plug_post_reload(Plug *pp)
+MUSIALIZER_PLUG void plug_post_reload(void *pp)
 {
     p = pp;
     for (size_t i = 0; i < p->tracks.count; ++i) {
         Track *it = &p->tracks.items[i];
         AttachAudioStreamProcessor(it->music.stream, callback);
     }
-    UnloadShader(p->circle);
-
-    size_t data_size;
-    void *data = plug_load_resource(TextFormat("./resources/shaders/glsl%d/circle.fs", GLSL_VERSION), &data_size);
-    p->circle = LoadShaderFromMemory(NULL, data);
-    plug_free_resource(data);
-    p->circle_radius_location = GetShaderLocation(p->circle, "radius");
-    p->circle_power_location = GetShaderLocation(p->circle, "power");
+    load_assets();
 }
 
 MUSIALIZER_PLUG void plug_update(void)
