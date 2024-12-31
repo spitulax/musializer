@@ -1,4 +1,4 @@
-{ stdenv
+{ gcc13Stdenv
 , lib
 , ffmpeg
 , libGL
@@ -16,6 +16,7 @@
 }:
 let
   inherit (darwin.apple_sdk.frameworks) Carbon Cocoa OpenGL;
+  stdenv = gcc13Stdenv;
 
   target =
     if stdenv.hostPlatform.isLinux then "LINUX"
