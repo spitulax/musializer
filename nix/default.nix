@@ -73,4 +73,16 @@ stdenv.mkDerivation {
 
     runHook postInstall
   '';
+
+  meta = {
+    description = "Music Visualizer";
+    mainProgram = "musializer";
+    homepage = "https://github.com/tsoding/musializer";
+    license = lib.licenses.mit;
+    platforms =
+      lib.platforms.linux
+      ++ lib.platforms.darwin
+      ++ lib.platforms.openbsd
+    ;
+  };
 }
